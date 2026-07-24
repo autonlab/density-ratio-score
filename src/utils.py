@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from sklearn.neighbors import NearestNeighbors
 
-def calculate_one_vs_rest_density_ratio_scores(X_train, y_train, X_test, test_indices, classes, d, norm, k, eps, n_permutations, group_keys, base_seed=42):
+def calculate_one_vs_rest_density_ratio_scores(X_train, y_train, X_test, test_indices, classes, d, k, eps, n_permutations, group_keys, base_seed=42, norm=True):
     """
     This function computes the density ratio scores for each class.
 
@@ -20,8 +20,6 @@ def calculate_one_vs_rest_density_ratio_scores(X_train, y_train, X_test, test_in
         The unique classes in the training labels.
     d: int
         The dimensionality of the data.
-    norm: bool
-        Whether to normalize the density ratio scores using a null distribution.
     k: int
         The number of nearest neighbors to use in the density ratio score calculation.
     eps: float
@@ -32,13 +30,18 @@ def calculate_one_vs_rest_density_ratio_scores(X_train, y_train, X_test, test_in
         The keys to group by when calculating the mean and std of the null scores. For example, ['chunk_idx', 'scheme_idx', 'modulation']. Basically, the keys that uniquely identify each test sample.
     base_seed: int, optional
         The base seed for the random number generator to ensure reproducibility. Default is 42.
+    norm: bool, optional
+        Whether to normalize the density ratio scores using a null distribution. This is very important
+        because if you do not do this, the higher the dimensionality of the data, the higher the density ratio scores will be. 
+        This is due to the formula of the density ratio score, which scales with the dimensionality of the data. 
+        Therefore, it is important to normalize the scores to make them comparable across different dimensionalities. Default is True.
 
     Returns:
     -------
     score_df: pd.DataFrame
         A DataFrame containing the density ratio scores for each class, shape (n_test_samples, n_classes).
     """
-    score_df = calculate_one_vs_rest_density_ratio_scores_helper(
+    score_df = compute_one_vs_rest_density_ratio_score_df(
         X_train=X_train,
         y_train=y_train,
         X_test=X_test,
@@ -115,34 +118,16 @@ def calculate_null_distribution_density_ratio_scores(X_train, y_train, X_test, t
         y_perm = y_train.copy()
         rng.shuffle(y_perm)
 
-        score_df_per_class = {}
-
-        for cls in classes:
-
-            in_mask = (y_perm == cls)
-            out_mask = ~in_mask
-
-            X_ref = X_train[in_mask]
-            Y_ref = X_train[out_mask]
-
-            s_fold = density_ratio_score(
-                    X_query=X_test,
-                    X_ref=X_ref,
-                    Y_ref=Y_ref,
-                    d=d,
-                    k=k,
-                    eps=eps,
-                )
-
-            df_cls = pd.DataFrame(
-                s_fold, 
-                index=test_indices, 
-                columns=[cls]
-            )
-
-            score_df_per_class[cls] = df_cls
-        # Concat score_df_per_class into a single DataFrame
-        score_df = pd.concat(score_df_per_class.values(), axis=1)
+        score_df = compute_one_vs_rest_density_ratio_score_df(
+            X_train=X_train,
+            y_train=y_perm,
+            X_test=X_test,
+            test_indices=test_indices,
+            classes=classes,
+            d=d,
+            k=k,
+            eps=eps,
+        )
         score_df['permutation'] = perm
         score_df.set_index('permutation', append=True, inplace=True)
         score_df_permutations.append(score_df)
@@ -182,7 +167,16 @@ def normalize_density_ratio_scores(score_df, null_mean, null_std):
     score_df = (score_df - null_mean) / (null_std + 1e-12)
     return score_df
 
-def calculate_one_vs_rest_density_ratio_scores_helper(X_train, y_train, X_test, test_indices, classes, d, k=4, eps=1e-7):
+def compute_one_vs_rest_density_ratio_score_df(
+    X_train,
+    y_train,
+    X_test,
+    test_indices,
+    classes,
+    d,
+    k,
+    eps,
+):
     '''
     This function computes the density ratio scores for each class in a one-vs-rest manner. 
     For each class, it calculates the density ratio score of the test samples against the training samples 
@@ -211,27 +205,28 @@ def calculate_one_vs_rest_density_ratio_scores_helper(X_train, y_train, X_test, 
     -------
     score_df: pd.DataFrame
         A DataFrame containing the density ratio scores for each class, shape (n_test_samples, n_classes).
+        
     '''
     score_df_per_class = {}
-    for cls in classes:
 
+    for cls in classes:
         in_mask = (y_train == cls) # Mask for in-class samples
         out_mask = ~in_mask # Mask for out-of-class samples
 
-        X_ref = X_train[in_mask] 
+        X_ref = X_train[in_mask]
         Y_ref = X_train[out_mask]
 
-        s_fold = density_ratio_score(
-                X_query=X_test,
-                X_ref=X_ref,
-                Y_ref=Y_ref,
-                d=d,
-                k=k,
-                eps=eps,
-            )
+        s = density_ratio_score(
+            X_query=X_test,
+            X_ref=X_ref,
+            Y_ref=Y_ref,
+            d=d,
+            k=k,
+            eps=eps,
+        )
 
         df_cls = pd.DataFrame(
-            s_fold,
+            s,
             index=test_indices,
             columns=[cls]
         )
@@ -293,3 +288,64 @@ def density_ratio_score(
 
     return s
 
+def get_target_class_scores(
+    score_df,
+    classes,
+    class_level
+    ):
+    """
+    Extract the score corresponding to each sample's true class.
+
+    Parameters
+    ----------
+    score_df : pd.DataFrame
+        DataFrame with one column per class.
+    classes : sequence
+        Ordered list of class labels.
+    class_level : str
+        Name of the index level containing the true class.
+    score_name : str, optional
+        Name of the output score column.
+
+    Returns
+    -------
+    pd.DataFrame
+        Single-column DataFrame containing each sample's score for its true class.
+    """
+    target_class_scores = []
+
+    for cls in classes:
+        scores = score_df.loc[
+            score_df.index.get_level_values(class_level) == cls,
+            cls,
+        ].to_frame(name='target_class_score')
+
+        target_class_scores.append(scores)
+
+    target_class_scores = pd.concat(target_class_scores)
+    target_class_scores.sort_index(inplace=True)
+
+    return target_class_scores
+
+def get_target_class_statistics(
+    target_class_scores,
+    class_level,
+    ):
+    '''
+    Compute per-class summary statistics for the target_class scores.
+    
+    Parameters
+    ----------
+    target_class_scores : pd.DataFrame
+        DataFrame containing the target_class scores for each sample's true class.
+    class_level : str
+        Name of the index level containing the true class.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing the summary statistics for each class.
+    '''
+    target_class_statistics = target_class_scores.groupby(level=class_level).agg(['mean', 'median', 'std', lambda x: x.quantile(0.05), lambda x: x.quantile(0.95)])
+    target_class_statistics.columns = ['mean', 'median', 'std', 'p05', 'p95']
+    return target_class_statistics
